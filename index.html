@@ -424,10 +424,16 @@ select {
       <input class="text" type="text" id="goalInput" inputmode="numeric" autocomplete="off">
       <p class="hint">Not shown on the main screen. The cheer character uses it to know when to celebrate.</p>
     </label>
-    <label class="field"><span>USDA API key</span>
-      <input type="password" id="keyInput" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Paste your key">
-      <p class="hint">Without a key, the app uses a shared demo key that allows only a few searches an hour. Get a free key at <a href="https://fdc.nal.usda.gov/api-key-signup" target="_blank" rel="noopener">fdc.nal.usda.gov</a>. It stays on this phone and is never saved to your website.</p>
-    </label>
+    <div class="field">
+      <label for="keyInput"><span style="display:block;font-weight:600;margin-bottom:6px">USDA API key</span></label>
+      <input class="text" type="text" id="keyInput" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="Paste your key">
+      <p class="hint" id="keyNow"></p>
+      <div class="row-btns" style="margin-top:10px">
+        <button class="btn secondary" type="button" id="testKey">Test key</button>
+      </div>
+      <p class="hint" id="keyStatus" role="status"></p>
+      <p class="hint">Get a free key at <a href="https://fdc.nal.usda.gov/api-key-signup" target="_blank" rel="noopener">fdc.nal.usda.gov</a>. It’s emailed to you and is about 40 letters and numbers. It stays on this phone and is never saved to your website.</p>
+    </div>
     <label class="toggle-row"><input type="checkbox" id="buddyInput"><span>Show cheer character</span></label>
     <button class="btn block" type="submit">Save settings</button>
 
@@ -439,7 +445,7 @@ select {
         <button class="btn secondary" type="button" id="importBtn">Import backup</button>
         <input type="file" id="importFile" accept="application/json,.json" hidden>
       </div>
-      <p class="hint" style="margin-top:18px">TheDaily version 3</p>
+      <p class="hint" style="margin-top:18px">TheDaily version 4</p>
     </div>
   </form>
 </dialog>
@@ -771,19 +777,50 @@ select {
     return { fdcId: f.fdcId, name, brand, type: f.dataType, per100, portions };
   }
 
-  async function searchFoods(query, type) {
-    const params = new URLSearchParams({
-      api_key: state.settings.apiKey || 'DEMO_KEY',
-      query,
-      pageSize: '30',
-      dataType: type === 'branded' ? 'Branded' : 'Foundation,SR Legacy,Survey (FNDDS)'
-    });
-    const res = await fetch(`${API_URL}?${params}`);
-    if (res.status === 429) throw new Error('rate');
-    if (res.status === 403 || res.status === 401) throw new Error('key');
-    if (!res.ok) throw new Error('http');
+  function apiError(code, status) {
+    const e = new Error(code);
+    e.status = status;
+    return e;
+  }
+  function checkResponse(res) {
+    if (res.status === 429) throw apiError('rate', 429);
+    if (res.status === 401 || res.status === 403) throw apiError('key', res.status);
+    if (!res.ok) throw apiError('http', res.status);
+  }
+  const cleanKey = k => String(k || '').replace(/\s+/g, '');
+
+  async function searchFoods(query, type, keyOverride) {
+    const key = cleanKey(keyOverride != null ? keyOverride : state.settings.apiKey) || 'DEMO_KEY';
+    const types = type === 'branded' ? ['Branded'] : ['Foundation', 'SR Legacy', 'Survey (FNDDS)'];
+    const keyParam = `api_key=${encodeURIComponent(key)}`;
+
+    // Preferred: the USDA's documented format, with the food types sent as a list.
+    let res = null;
+    try {
+      res = await fetch(`${API_URL}?${keyParam}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query, pageSize: 30, dataType: types })
+      });
+    } catch (e) { res = null; }
+
+    // Fallback: a plain search, with the food types filtered here instead.
+    let filterHere = false;
+    if (!res || res.status === 400 || res.status === 405 || res.status === 415) {
+      filterHere = true;
+      try {
+        res = await fetch(`${API_URL}?${keyParam}&${new URLSearchParams({ query, pageSize: '60' })}`);
+      } catch (e) { throw apiError('network'); }
+    }
+    checkResponse(res);
+
     const data = await res.json();
-    return (data.foods || []).map(normalizeFood).filter(f => f.per100.kcal != null);
+    let foods = data.foods || [];
+    if (filterHere) {
+      const matching = foods.filter(f => types.includes(f.dataType));
+      if (matching.length) foods = matching;
+    }
+    return foods.map(normalizeFood).filter(f => f.per100.kcal != null).slice(0, 30);
   }
 
   // ---------- Add food sheet ----------
@@ -865,9 +902,13 @@ select {
       $('#resultsWrap').replaceChildren(resultList(foods));
     } catch (err) {
       if (seq !== searchSeq) return;
+      const usingDemo = !cleanKey(state.settings.apiKey);
       const msgs = {
-        rate: 'Search limit reached for now. Add your own free API key in Settings to search more.',
-        key: 'The USDA didn’t accept the API key. Check it in Settings.'
+        rate: usingDemo
+          ? 'The shared demo key has hit its hourly limit. Add your own free API key in Settings.'
+          : 'Your API key has hit its hourly limit. Try again in a little while.',
+        key: 'The USDA didn’t accept your API key. Open Settings and tap Test key.',
+        http: `The USDA search returned an error (code ${err.status}). Try again in a moment.`
       };
       setStatus(msgs[err.message] || 'Couldn’t reach the USDA database. Check your connection and try again.');
     }
@@ -971,24 +1012,62 @@ select {
 
   // ---------- Settings ----------
   const settingsSheet = $('#settingsSheet');
-  $('#openSettings').addEventListener('click', () => {
-    $('#goalInput').value = String(state.settings.goal);
-    $('#keyInput').value = state.settings.apiKey || '';
-    $('#buddyInput').checked = state.settings.showBuddy !== false;
-    settingsSheet.showModal();
-  });
-  $('#settingsForm').addEventListener('submit', e => {
-    e.preventDefault();
+  function showKeyNow() {
+    const k = cleanKey(state.settings.apiKey);
+    $('#keyNow').textContent = k
+      ? `Saved: your key ending in ${k.slice(-4)} (${k.length} characters).`
+      : 'No key saved yet, so searches use the shared demo key (a few searches an hour).';
+  }
+
+  // Saves whatever is in the form. Runs on Save and also whenever the sheet closes,
+  // so a pasted key is kept even if the sheet is closed with ✕.
+  function persistSettings() {
     const goal = Math.round(parseNum($('#goalInput').value));
-    if (!(goal >= 500 && goal <= 10000)) { toast('Set a goal between 500 and 10,000 kcal.'); return; }
-    state.settings.goal = goal;
-    state.settings.apiKey = $('#keyInput').value.trim();
+    const goalOk = goal >= 500 && goal <= 10000;
+    if (goalOk) state.settings.goal = goal;
+    state.settings.apiKey = cleanKey($('#keyInput').value);
     state.settings.showBuddy = $('#buddyInput').checked;
     Buddy.setVisible(state.settings.showBuddy);
     save();
     render();
+    showKeyNow();
+    return goalOk;
+  }
+
+  $('#openSettings').addEventListener('click', () => {
+    $('#goalInput').value = String(state.settings.goal);
+    $('#keyInput').value = state.settings.apiKey || '';
+    $('#buddyInput').checked = state.settings.showBuddy !== false;
+    $('#keyStatus').textContent = '';
+    showKeyNow();
+    settingsSheet.showModal();
+  });
+  settingsSheet.addEventListener('close', persistSettings);
+
+  $('#settingsForm').addEventListener('submit', e => {
+    e.preventDefault();
+    if (!persistSettings()) { toast('Set a goal between 500 and 10,000 kcal.'); return; }
     settingsSheet.close();
     toast('Settings saved');
+  });
+
+  $('#testKey').addEventListener('click', async () => {
+    const key = cleanKey($('#keyInput').value);
+    const status = $('#keyStatus');
+    if (!key) { status.textContent = 'Paste your key in the box above first.'; return; }
+    status.textContent = 'Testing…';
+    try {
+      await searchFoods('apple', 'generic', key);
+      persistSettings();
+      status.textContent = 'Your key works and is saved. Searches will use it from now on.';
+    } catch (err) {
+      const msgs = {
+        key: `The USDA rejected this key (code ${err.status}). It’s ${key.length} characters long; a full key is usually 40. Copy it again from the email, making sure nothing is cut off.`,
+        rate: 'This key has hit its hourly limit. Wait an hour and try again.',
+        http: `The USDA returned an error (code ${err.status}). Try again in a moment.`
+      };
+      status.textContent = msgs[err.message] || 'Couldn’t reach the USDA. Check your internet connection and try again.';
+    }
   });
 
   $('#exportBtn').addEventListener('click', () => {
